@@ -1,77 +1,42 @@
 package com.acme.ride.driver.service;
 
-import java.io.UnsupportedEncodingException;
+import java.util.HashMap;
+import java.util.Map;
 
-import io.vertx.amqpbridge.AmqpBridge;
-import io.vertx.amqpbridge.AmqpBridgeOptions;
-import io.vertx.amqpbridge.AmqpConstants;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Future;
-import io.vertx.core.eventbus.Message;
-import io.vertx.core.eventbus.MessageConsumer;
 import io.vertx.core.json.JsonObject;
 import io.vertx.core.logging.Logger;
 import io.vertx.core.logging.LoggerFactory;
-import io.vertx.core.net.JksOptions;
+import io.vertx.kafka.client.consumer.KafkaConsumer;
+import io.vertx.kafka.client.consumer.KafkaConsumerRecord;
 
 public class MessageConsumerVerticle extends AbstractVerticle {
 
     private final static Logger log = LoggerFactory.getLogger("MessageConsumer");
 
-    private AmqpBridge bridge;
+    private KafkaConsumer<String, String> kafkaConsumer;
 
     @Override
     public void start(Future<Void> startFuture) throws Exception {
-        AmqpBridgeOptions bridgeOptions = new AmqpBridgeOptions();
-        bridgeOptions.setSsl(config().getBoolean("amqp.ssl"));
-        bridgeOptions.setTrustAll(config().getBoolean("amqp.ssl.trustall"));
-        bridgeOptions.setHostnameVerificationAlgorithm(!config().getBoolean("amqp.ssl.verifyhost") ? "" : "HTTPS");
-        bridgeOptions.setReplyHandlingSupport(config().getBoolean("amqp.replyhandling"));
-        if (!bridgeOptions.isTrustAll()) {
-            JksOptions jksOptions = new JksOptions()
-                    .setPath(config().getString("amqp.truststore.path"))
-                    .setPassword(config().getString("amqp.truststore.password"));
-            bridgeOptions.setTrustStoreOptions(jksOptions);
-        }
-        bridge = AmqpBridge.create(vertx, bridgeOptions);
-        String host = config().getString("amqp.host");
-        int port = config().getInteger("amqp.port");
-        String username = config().getString("amqp.user", "anonymous");
-        String password = config().getString("amqp.password", "anonymous");
-        bridge.start(host, port, username, password, ar -> {
-            if (ar.failed()) {
-                log.warn("Bridge startup failed");
-                startFuture.fail(ar.cause());
-            } else {
-                log.info("AMQP bridge to " + host + ":" + port + " started");
-                bridgeStarted();
-                startFuture.complete();
-            }
-        });
+        Map<String, String> kafkaConfig = new HashMap<>();
+        kafkaConfig.put("bootstrap.servers", config().getString("kafka.bootstrap.servers"));
+        kafkaConfig.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+        kafkaConfig.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+        kafkaConfig.put("group.id", config().getString("kafka.groupid"));
+        kafkaConfig.put("enable.auto.commit", "false");
+        kafkaConsumer = KafkaConsumer.create(vertx, kafkaConfig);
+        kafkaConsumer.handler(this::handleMessage);
+        kafkaConsumer.subscribe(config().getString("kafka.topic.driver-command"));
+
+        startFuture.complete();
     }
 
-    private void bridgeStarted() {
-        MessageConsumer<JsonObject> consumer = bridge.<JsonObject>createConsumer(config().getString("amqp.consumer.driver-command"))
-                .exceptionHandler(this::handleExceptions);
-        consumer.handler(this::handleMessage);
-    }
+    private void handleMessage(KafkaConsumerRecord<String, String> msg) {
+        JsonObject message = new JsonObject(msg.value());
 
-    private void handleMessage(Message<JsonObject> msg) {
-        JsonObject msgBody = msg.body();
-        JsonObject message = null;
-        if (AmqpConstants.BODY_TYPE_DATA.equals(msgBody.getString(AmqpConstants.BODY_TYPE))) {
-            try {
-                message = new JsonObject(new String(msgBody.getBinary(AmqpConstants.BODY, new byte[]{}), "UTF-8"));
-            } catch (UnsupportedEncodingException ignore) {
-            }
-        } else if (AmqpConstants.BODY_TYPE_VALUE.equals(msgBody.getString(AmqpConstants.BODY_TYPE))) {
-            message = new JsonObject(msgBody.getString("body"));
-        } else {
-            log.warn("Unsupported AMQP Message Type " + msgBody.getString(AmqpConstants.BODY_TYPE) + ". Ignoring message");
-            return;
-        }
-        if (message == null || message.isEmpty()) {
-            log.warn("Message " + msgBody.toString() + " has no contents. Ignoring message");
+        if (message.isEmpty()) {
+            log.warn("Message " + msg.key() + " has no contents. Ignoring message");
             return;
         }
         String messageType = message.getString("messageType");
@@ -79,19 +44,22 @@ public class MessageConsumerVerticle extends AbstractVerticle {
             log.debug("Unexpected message type '" + messageType + "' in message " + message + ". Ignoring message");
             return;
         }
-        log.debug("Consumed 'AssignedDriverCommand' message for ride " + message.getJsonObject("payload").getString("rideId"));
+        log.debug("Consumed 'AssignDriverCommand' message. Ride: " + message.getJsonObject("payload").getString("rideId")
+            + " , topic: " + msg.topic() + " ,  partition: " + msg.partition());
+
         // send message to producer verticle
         vertx.eventBus().<JsonObject>send("message-producer", message);
-    }
 
-    private void handleExceptions(Throwable t) {
-        log.error("Exception on AMQP consumer", t);
+        //commit message
+        kafkaConsumer.commit();
     }
 
     @Override
     public void stop(Future<Void> stopFuture) throws Exception {
-        if (bridge != null) {
-            bridge.close(ar -> {});
+        if (kafkaConsumer != null) {
+            kafkaConsumer.commit();
+            kafkaConsumer.unsubscribe();
+            kafkaConsumer.close();
         }
         stopFuture.complete();
     }

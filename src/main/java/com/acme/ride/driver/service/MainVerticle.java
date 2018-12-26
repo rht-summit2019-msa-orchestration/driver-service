@@ -48,6 +48,7 @@ public class MainVerticle extends AbstractVerticle {
 
     @SuppressWarnings({ "rawtypes", "unchecked" })
     private void deployVerticles(JsonObject config, Future<Void> startFuture) {
+
         Future<String> restApiVerticleFuture = Future.future();
         Future<String> messageConsumerVerticleFuture = Future.future();
         Future<String> messageProducerVerticleFuture = Future.future();

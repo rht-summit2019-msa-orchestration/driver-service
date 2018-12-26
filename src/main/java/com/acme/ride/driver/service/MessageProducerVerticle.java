@@ -3,29 +3,24 @@ package com.acme.ride.driver.service;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.time.Instant;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 
-import io.vertx.amqpbridge.AmqpBridge;
-import io.vertx.amqpbridge.AmqpBridgeOptions;
-import io.vertx.amqpbridge.AmqpConstants;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Future;
 import io.vertx.core.eventbus.Message;
-import io.vertx.core.eventbus.MessageProducer;
 import io.vertx.core.json.JsonObject;
 import io.vertx.core.logging.Logger;
 import io.vertx.core.logging.LoggerFactory;
-import io.vertx.core.net.JksOptions;
+import io.vertx.kafka.client.producer.KafkaProducer;
+import io.vertx.kafka.client.producer.KafkaProducerRecord;
 
 public class MessageProducerVerticle extends AbstractVerticle {
 
     private final static Logger log = LoggerFactory.getLogger("MessageProducer");
 
-    private AmqpBridge bridge;
-
-    private MessageProducer<JsonObject> driverEventProducer;
-
-    private MessageProducer<JsonObject> rideEventProducer;
+    private KafkaProducer<String, String> kafkaProducer;
 
     private int minDelayBeforeDriverAssignedEvent;
 
@@ -41,45 +36,23 @@ public class MessageProducerVerticle extends AbstractVerticle {
 
     @Override
     public void start(Future<Void> startFuture) throws Exception {
-        AmqpBridgeOptions bridgeOptions = new AmqpBridgeOptions();
-        bridgeOptions.setConnectTimeout(10000);
-        bridgeOptions.setSsl(config().getBoolean("amqp.ssl"));
-        bridgeOptions.setTrustAll(config().getBoolean("amqp.ssl.trustall"));
-        bridgeOptions.setHostnameVerificationAlgorithm(!config().getBoolean("amqp.ssl.verifyhost") ? "" : "HTTPS");
-        bridgeOptions.setReplyHandlingSupport(config().getBoolean("amqp.replyhandling"));
-        if (!bridgeOptions.isTrustAll()) {
-            JksOptions jksOptions = new JksOptions()
-                    .setPath(config().getString("amqp.truststore.path"))
-                    .setPassword(config().getString("amqp.truststore.password"));
-            bridgeOptions.setTrustStoreOptions(jksOptions);
-        }
-        bridge = AmqpBridge.create(vertx, bridgeOptions);
-        String host = config().getString("amqp.host");
-        int port = config().getInteger("amqp.port");
-        String username = config().getString("amqp.user", "anonymous");
-        String password = config().getString("amqp.password", "anonymous");
-        bridge.start(host, port, username, password, ar -> {
-            if (ar.failed()) {
-                log.warn("Bridge startup failed");
-                startFuture.fail(ar.cause());
-            } else {
-                log.info("AMQP bridge to " + host + ":" + port + " started");
-                bridgeStarted();
-                startFuture.complete();
-            }
-        });
+        Map<String, String> kafkaConfig = new HashMap<>();
+        kafkaConfig.put("bootstrap.servers", config().getString("kafka.bootstrap.servers"));
+        kafkaConfig.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+        kafkaConfig.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+        kafkaConfig.put("acks", "1");
+        kafkaProducer = KafkaProducer.create(vertx, kafkaConfig);
+
         minDelayBeforeDriverAssignedEvent = config().getInteger("driver.assigned.min.delay", 1);
         maxDelayBeforeDriverAssignedEvent = config().getInteger("driver.assigned.max.delay", 3);
         minDelayBeforeRideStartedEvent = config().getInteger("ride.started.min.delay", 5);
         maxDelayBeforeRideStartedEvent = config().getInteger("ride.started.max.delay", 10);
         minDelayBeforeRideEndedEvent = config().getInteger("ride.ended.min.delay", 5);
         maxDelayBeforeRideEndedEvent = config().getInteger("ride.ended.max.delay", 10);
-    }
 
-    private void bridgeStarted() {
-        driverEventProducer = bridge.<JsonObject>createProducer(config().getString("amqp.producer.driver-event")).exceptionHandler(this::handleExceptions);
-        rideEventProducer = bridge.<JsonObject>createProducer(config().getString("amqp.producer.ride-event")).exceptionHandler(this::handleExceptions);
         vertx.eventBus().consumer("message-producer", this::handleMessage);
+
+        startFuture.complete();
     }
 
     private void handleMessage(Message<JsonObject> msg) {
@@ -173,8 +146,8 @@ public class MessageProducerVerticle extends AbstractVerticle {
         payload.put("driverId", driverId);
         msgOut.put("payload", payload);
 
-        sendMessageToTopic(msgOut, driverEventProducer);
-        log.debug("Sent 'DriverAssignedMessage' for ride " + rideId);
+        sendMessageToTopic(config().getString("kafka.topic.driver-event"), rideId, msgOut.toString());
+        log.debug("Sent 'DriverAssignedEvent' message for ride " + rideId);
     }
 
     private void doSendRideStartedEventMessage(JsonObject msgIn) {
@@ -190,8 +163,8 @@ public class MessageProducerVerticle extends AbstractVerticle {
         payload.put("timestamp", Instant.now().toEpochMilli());
         msgOut.put("payload", payload);
 
-        sendMessageToTopic(msgOut, rideEventProducer);
-        log.debug("Sent 'RideStartedMessage' for ride " + rideId);
+        sendMessageToTopic(config().getString("kafka.topic.ride-event"), rideId, msgOut.toString());
+        log.debug("Sent 'RideStartedEvent' message for ride " + rideId);
     }
 
     private void doSendRideEndedEventMessage(JsonObject msgIn) {
@@ -206,40 +179,24 @@ public class MessageProducerVerticle extends AbstractVerticle {
         payload.put("rideId", rideId);
         payload.put("timestamp", Instant.now().toEpochMilli());
         msgOut.put("payload", payload);
-
-        sendMessageToTopic(msgOut, rideEventProducer);
-        log.debug("Sent 'RideEndedMessage' for ride " + rideId);
+        sendMessageToTopic(config().getString("kafka.topic.ride-event"), rideId, msgOut.toString());
+        log.debug("Sent 'RideEndedEvent' message for ride " + rideId);
     }
 
-    private void sendMessageToTopic(JsonObject body, MessageProducer<JsonObject> messageProducer) {
-        JsonObject amqpMsg = new JsonObject();
-        amqpMsg.put(AmqpConstants.BODY_TYPE, AmqpConstants.BODY_TYPE_VALUE);
-        amqpMsg.put(AmqpConstants.BODY, body.toString());
-        JsonObject annotations = new JsonObject();
-        byte b = 5;
-        annotations.put("x-opt-jms-msg-type", b);
-        amqpMsg.put(AmqpConstants.MESSAGE_ANNOTATIONS, annotations);
-        messageProducer.send(amqpMsg);
+
+    private void sendMessageToTopic(String topic, String key, String value) {
+        KafkaProducerRecord<String, String> record = KafkaProducerRecord.create(topic, key, value);
+        kafkaProducer.write(record);
     }
 
     private String getRideId(JsonObject message) {
         return message.getJsonObject("payload").getString("rideId");
     }
 
-    private void handleExceptions(Throwable t) {
-        log.error("Exception on AMQP Producer", t);
-    }
-
     @Override
     public void stop(Future<Void> stopFuture) throws Exception {
-        if (driverEventProducer != null) {
-            driverEventProducer.close();
-        }
-        if (rideEventProducer != null) {
-            rideEventProducer.close();
-        }
-        if (bridge != null) {
-            bridge.close(ar -> {});
+        if (kafkaProducer != null) {
+            kafkaProducer.close();
         }
         stopFuture.complete();
     }
