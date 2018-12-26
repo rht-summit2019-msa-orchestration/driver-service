@@ -12,7 +12,7 @@
     <skipTests>false</skipTests>
     <skipITs>${skipTests}</skipITs>
     <skipUTs>${skipTests}</skipUTs>
-    <version.vertx>3.5.3.redhat-00001</version.vertx>
+    <version.vertx>3.5.4.redhat-00002</version.vertx>
     <version.fabric8-maven-plugin>3.5.39</version.fabric8-maven-plugin>
     <version.vertx-maven-plugin>1.0.17</version.vertx-maven-plugin>
     <vertx.verticle>com.acme.ride.driver.service.MainVerticle</vertx.verticle>
