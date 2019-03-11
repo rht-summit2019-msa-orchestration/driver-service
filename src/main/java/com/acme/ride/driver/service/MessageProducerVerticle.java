@@ -7,6 +7,10 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
+import com.acme.ride.driver.service.tracing.TracingKafkaUtils;
+import io.opentracing.Span;
+import io.opentracing.Tracer;
+import io.opentracing.util.GlobalTracer;
 import io.vertx.core.AbstractVerticle;
 import io.vertx.core.Future;
 import io.vertx.core.eventbus.Message;
@@ -22,6 +26,8 @@ public class MessageProducerVerticle extends AbstractVerticle {
 
     private KafkaProducer<String, String> kafkaProducer;
 
+    private Tracer tracer;
+
     private int minDelayBeforeDriverAssignedEvent;
 
     private int maxDelayBeforeDriverAssignedEvent;
@@ -36,6 +42,8 @@ public class MessageProducerVerticle extends AbstractVerticle {
 
     @Override
     public void start(Future<Void> startFuture) throws Exception {
+        tracer = GlobalTracer.get();
+
         Map<String, String> kafkaConfig = new HashMap<>();
         kafkaConfig.put("bootstrap.servers", config().getString("kafka.bootstrap.servers"));
         kafkaConfig.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
@@ -100,7 +108,7 @@ public class MessageProducerVerticle extends AbstractVerticle {
 
     private void sendDriverAssignedMessage(final Message<JsonObject> msgIn, final String driverId) {
         vertx.setTimer(delayBeforeMessage(minDelayBeforeDriverAssignedEvent, maxDelayBeforeDriverAssignedEvent), i -> {
-            doSendDriverAssignedMessage(msgIn.body(), driverId);
+            doSendDriverAssignedMessage(msgIn, driverId);
             sendRideStartedEventMessage(msgIn);
         });
     }
@@ -111,14 +119,14 @@ public class MessageProducerVerticle extends AbstractVerticle {
             return;
         }
         vertx.setTimer(delayBeforeMessage(minDelayBeforeRideStartedEvent, maxDelayBeforeRideStartedEvent), i -> {
-            doSendRideStartedEventMessage(msgIn.body());
+            doSendRideStartedEventMessage(msgIn);
             sendRideEndedEventMessage(msgIn);
         });
     }
 
     private void sendRideEndedEventMessage(final Message<JsonObject> msgIn) {
         vertx.setTimer(delayBeforeMessage(minDelayBeforeRideEndedEvent, maxDelayBeforeRideEndedEvent), i -> {
-            doSendRideEndedEventMessage(msgIn.body());
+            doSendRideEndedEventMessage(msgIn);
         });
     }
 
@@ -133,7 +141,8 @@ public class MessageProducerVerticle extends AbstractVerticle {
         return s.add(new BigDecimal(Math.random()).multiply(new BigDecimal(e.subtract(s))).toBigInteger());
     }
 
-    private void doSendDriverAssignedMessage(JsonObject msgIn, String driverId) {
+    private void doSendDriverAssignedMessage(Message<JsonObject> msg, String driverId) {
+        JsonObject msgIn = msg.body();
         JsonObject msgOut = new JsonObject();
         msgOut.put("messageType","DriverAssignedEvent");
         msgOut.put("id", UUID.randomUUID().toString());
@@ -146,11 +155,12 @@ public class MessageProducerVerticle extends AbstractVerticle {
         payload.put("driverId", driverId);
         msgOut.put("payload", payload);
 
-        sendMessageToTopic(config().getString("kafka.topic.driver-event"), rideId, msgOut.toString());
+        sendMessageToTopic(config().getString("kafka.topic.driver-event"), rideId, msgOut.toString(), msg);
         log.debug("Sent 'DriverAssignedEvent' message for ride " + rideId);
     }
 
-    private void doSendRideStartedEventMessage(JsonObject msgIn) {
+    private void doSendRideStartedEventMessage(Message<JsonObject> msg) {
+        JsonObject msgIn = msg.body();
         JsonObject msgOut = new JsonObject();
         msgOut.put("messageType","RideStartedEvent");
         msgOut.put("id", UUID.randomUUID().toString());
@@ -163,11 +173,12 @@ public class MessageProducerVerticle extends AbstractVerticle {
         payload.put("timestamp", Instant.now().toEpochMilli());
         msgOut.put("payload", payload);
 
-        sendMessageToTopic(config().getString("kafka.topic.ride-event"), rideId, msgOut.toString());
+        sendMessageToTopic(config().getString("kafka.topic.ride-event"), rideId, msgOut.toString(), msg);
         log.debug("Sent 'RideStartedEvent' message for ride " + rideId);
     }
 
-    private void doSendRideEndedEventMessage(JsonObject msgIn) {
+    private void doSendRideEndedEventMessage(Message<JsonObject> msg) {
+        JsonObject msgIn = msg.body();
         JsonObject msgOut = new JsonObject();
         msgOut.put("messageType","RideEndedEvent");
         msgOut.put("id", UUID.randomUUID().toString());
@@ -179,14 +190,19 @@ public class MessageProducerVerticle extends AbstractVerticle {
         payload.put("rideId", rideId);
         payload.put("timestamp", Instant.now().toEpochMilli());
         msgOut.put("payload", payload);
-        sendMessageToTopic(config().getString("kafka.topic.ride-event"), rideId, msgOut.toString());
+        sendMessageToTopic(config().getString("kafka.topic.ride-event"), rideId, msgOut.toString(), msg);
         log.debug("Sent 'RideEndedEvent' message for ride " + rideId);
     }
 
 
-    private void sendMessageToTopic(String topic, String key, String value) {
+    private void sendMessageToTopic(String topic, String key, String value, Message<JsonObject> msg) {
         KafkaProducerRecord<String, String> record = KafkaProducerRecord.create(topic, key, value);
-        kafkaProducer.write(record);
+        Span span = TracingKafkaUtils.buildAndInjectSpan(record, tracer, msg);
+        try {
+            kafkaProducer.write(record);
+        } finally {
+            span.finish();
+        }
     }
 
     private String getRideId(JsonObject message) {
